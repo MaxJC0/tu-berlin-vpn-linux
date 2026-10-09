@@ -1,0 +1,11 @@
+#!/bin/sh
+# Connect to TU Berlin VPN (split tunnel). A login window opens for the TU SSO; Ctrl+C disconnects.
+out=$(printf 'DATA_KEY=gateway\nDATA_VAL=vpn.tu-berlin.de\n\nDATA_KEY=protocol\nDATA_VAL=anyconnect\n\nDATA_KEY=useragent\nDATA_VAL=AnyConnect Linux_64 4.10.07061\n\nDONE\n\n' |
+  WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 /usr/lib/nm-openconnect-auth-dialog -u "$(nmcli -g connection.uuid connection show "TU Berlin VPN")" -n "TU Berlin VPN" \
+    -s org.freedesktop.NetworkManager.openconnect -i)
+get() { printf '%s\n' "$out" | awk -v k="$1" 'p{print; exit} $0==k{p=1}'; }
+cookie=$(get cookie); gateway=$(get gateway); gwcert=$(get gwcert)
+[ -n "$cookie" ] || { echo "Login cancelled or failed."; exit 1; }
+echo "Logged in, starting tunnel (may ask for your sudo password)..."
+echo "$cookie" | sudo openconnect --protocol=anyconnect --useragent="AnyConnect Linux_64 4.10.07061" --cookie-on-stdin \
+  ${gwcert:+--servercert "$gwcert"} "$gateway"

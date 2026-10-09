@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=TU Berlin VPN
+Comment=Log in to the TU Berlin VPN and keep it in the tray
+Exec=@BINDIR@/tu-vpn-tray
+Icon=network-vpn
+Terminal=false
+Categories=Network;
+Keywords=vpn;tu;berlin;cisco;anyconnect;

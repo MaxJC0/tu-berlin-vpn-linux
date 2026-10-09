@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""TU Berlin VPN tray app: SSO login window -> NetworkManager connection -> tray icon with status."""
+import fcntl
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+from PyQt6.QtCore import QProcess, QProcessEnvironment, QTimer
+from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
+from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
+
+CON_NAME = "TU Berlin VPN"
+GATEWAY = "vpn.tu-berlin.de"
+USER_AGENT = "AnyConnect Linux_64 4.10.07061"
+AUTH_DIALOG = "/usr/lib/nm-openconnect-auth-dialog"
+
+
+def dot_icon(color):
+    pm = QPixmap(64, 64)
+    pm.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setBrush(QColor(color))
+    p.setPen(QColor(0, 0, 0, 0))
+    p.drawEllipse(8, 8, 48, 48)
+    p.end()
+    return QIcon(pm)
+
+
+def themed(names, fallback_color):
+    for n in names:
+        if QIcon.hasThemeIcon(n):
+            return QIcon.fromTheme(n)
+    return dot_icon(fallback_color)
+
+
+def con_uuid():
+    r = subprocess.run(["nmcli", "-g", "connection.uuid", "connection", "show", CON_NAME],
+                       capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def nm_status():
+    """Return (state, ipv4) of the VPN connection; state is '' when inactive."""
+    r = subprocess.run(
+        ["nmcli", "-t", "-g", "GENERAL.STATE,IP4.ADDRESS", "connection", "show", CON_NAME],
+        capture_output=True, text=True,
+    )
+    lines = [l for l in r.stdout.splitlines() if l]
+    state = lines[0] if lines else ""
+    ip = lines[1].split("/")[0] if len(lines) > 1 else ""
+    return state, ip
+
+
+class VpnTray:
+    def __init__(self, app):
+        self.app = app
+        self.connected_since = None
+        self.icon_on = themed(["network-vpn", "network-vpn-symbolic"], "#2e9d4f")
+        self.icon_busy = themed(["network-vpn-acquiring", "network-vpn-acquiring-symbolic"], "#d9a400")
+
+        self.tray = QSystemTrayIcon(self.icon_busy)
+        menu = QMenu()
+        self.status_action = QAction("Connecting…")
+        self.status_action.setEnabled(False)
+        menu.addAction(self.status_action)
+        menu.addSeparator()
+        disconnect = QAction("Disconnect", menu)
+        disconnect.triggered.connect(self.disconnect)
+        menu.addAction(disconnect)
+        self.menu = menu
+        self.tray.setContextMenu(menu)
+        self.tray.setToolTip("TU Berlin VPN: connecting…")
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.refresh)
+
+        state, _ = nm_status()
+        if state == "activated":
+            self.on_connected()
+        else:
+            self.login()
+
+    # --- login -------------------------------------------------------------
+    def login(self):
+        self.auth = QProcess()
+        env = QProcessEnvironment.systemEnvironment()
+        # WebKitGTK freezes on NVIDIA/Wayland without these
+        env.insert("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+        env.insert("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
+        self.auth.setProcessEnvironment(env)
+        self.auth.finished.connect(self.on_auth_done)
+        self.auth.start(AUTH_DIALOG, ["-u", con_uuid(), "-n", CON_NAME,
+                                      "-s", "org.freedesktop.NetworkManager.openconnect", "-i"])
+        data = {"gateway": GATEWAY, "protocol": "anyconnect", "useragent": USER_AGENT}
+        payload = "".join(f"DATA_KEY={k}\nDATA_VAL={v}\n\n" for k, v in data.items()) + "DONE\n\n"
+        self.auth.write(payload.encode())
+        self.auth.closeWriteChannel()
+
+    def on_auth_done(self):
+        lines = bytes(self.auth.readAllStandardOutput()).decode().split("\n")
+        secrets = {}
+        i = 0
+        while i + 1 < len(lines) and lines[i]:
+            secrets[lines[i]] = lines[i + 1]
+            i += 2
+        if not secrets.get("cookie"):
+            self.app.quit()  # login window cancelled or failed
+            return
+        self.tray.show()
+        self.bring_up(secrets)
+
+    def bring_up(self, secrets):
+        fd, path = tempfile.mkstemp(dir=os.environ.get("XDG_RUNTIME_DIR"))
+        with os.fdopen(fd, "w") as f:
+            for k, v in secrets.items():
+                f.write(f"vpn.secrets.{k}:{v}\n")
+        self.secrets_file = path
+        self.up = QProcess()
+        self.up.finished.connect(self.on_up_done)
+        self.up.start("nmcli", ["connection", "up", CON_NAME, "passwd-file", path])
+
+    def on_up_done(self, code, _status):
+        os.unlink(self.secrets_file)
+        if code != 0:
+            err = bytes(self.up.readAllStandardError()).decode().strip()
+            QMessageBox.critical(None, "TU Berlin VPN", f"Could not start the VPN:\n\n{err}")
+            self.app.quit()
+            return
+        self.on_connected()
+
+    # --- connected ---------------------------------------------------------
+    def on_connected(self):
+        self.connected_since = time.time()
+        self.tray.setIcon(self.icon_on)
+        self.tray.show()
+        self.refresh()
+        self.timer.start(5000)
+        self.tray.showMessage("TU Berlin VPN", "Connected", self.icon_on, 3000)
+
+    def refresh(self):
+        state, ip = nm_status()
+        if state != "activated":
+            self.timer.stop()
+            self.tray.showMessage("TU Berlin VPN", "Disconnected", self.icon_busy, 3000)
+            QTimer.singleShot(1500, self.app.quit)
+            return
+        mins = int(time.time() - self.connected_since) // 60
+        dur = f"{mins // 60} h {mins % 60} min" if mins >= 60 else f"{mins} min"
+        text = f"TU Berlin VPN: connected\nIP {ip} · {dur}"
+        self.tray.setToolTip(text)
+        self.status_action.setText(f"Connected · {ip} · {dur}")
+
+    def disconnect(self):
+        self.timer.stop()
+        subprocess.run(["nmcli", "connection", "down", CON_NAME], capture_output=True)
+        self.app.quit()
+
+
+def main():
+    # single instance
+    lock = open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "tu-vpn-tray.lock"), "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if nm_status()[0] == "activated":
+            subprocess.run(["notify-send", "TU Berlin VPN", "Already connected – see the tray icon."])
+            return
+        # not connected: the old instance is stuck (e.g. login window lost) -> replace it
+        lock.seek(0)
+        old = lock.read().strip()
+        if old.isdigit():
+            subprocess.run(["pkill", "-P", old])
+            subprocess.run(["kill", old])
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    lock.seek(0)
+    lock.truncate()
+    lock.write(str(os.getpid()))
+    lock.flush()
+    app = QApplication(sys.argv)
+    app.setApplicationName("TU Berlin VPN")
+    app.setDesktopFileName("tu-vpn")
+    app.setQuitOnLastWindowClosed(False)
+    _tray = VpnTray(app)
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
